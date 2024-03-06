@@ -1,0 +1,783 @@
+Script started on 2022-02-27 20:43:18-06:00 [TERM="xterm-256color" TTY="/dev/pts/44" COLUMNS="123" LINES="33"]
+[4mukko[24m:[1m~[0m% date
+Sun 27 Feb 2022 08:43:22 PM CST
+[4mukko[24m:[1m~[0m% nvidia-smi
+Sun Feb 27 20:43:26 2022       
++-----------------------------------------------------------------------------+
+| NVIDIA-SMI 495.29.05    Driver Version: 495.29.05    CUDA Version: 11.5     |
+|-------------------------------+----------------------+----------------------+
+| GPU  Name        Persistence-M| Bus-Id        Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp  Perf  Pwr:Usage/Cap|         Memory-Usage | GPU-Util  Compute M. |
+|                               |                      |               MIG M. |
+|===============================+======================+======================|
+|   0  Tesla P100-PCIE...  On   | 00000000:03:00.0 Off |                    0 |
+| N/A   28C    P0    23W / 250W |      0MiB / 12198MiB |      0%      Default |
+|                               |                      |                  N/A |
++-------------------------------+----------------------+----------------------+
+                                                                               
++-----------------------------------------------------------------------------+
+| Processes:                                                                  |
+|  GPU   GI   CI        PID   Type   Process name                  GPU Memory |
+|        ID   ID                                                   Usage      |
+|=============================================================================|
+|  No running processes found                                                 |
++-----------------------------------------------------------------------------+
+[4mukko[24m:[1m~[0m% cat LM_train.py
+"""
+Sources for the code:
+1. https://github.com/sleebapaul/gospel_of_rnn/blob/master/pytorch_LSTM.ipynb
+2. https://github.com/pytorch/examples/tree/master/word_language_model
+
+The original Dataset provided has been reduced and 120,000 lines have been used for the Assignment. The dataset was then split further into Training, Validation and Test
+"""
+
+from os import path
+import torch
+torch.manual_seed(1111)
+import math
+import os
+import random
+import re
+import time
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+import seaborn as sns
+import torch.nn as nn
+
+from torch.nn.utils import clip_grad_norm_
+
+import argparse
+
+ 
+#prints the device 
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(device)
+print("\n")
+
+parser = argparse.ArgumentParser(description='Word Language Model using LSTM')
+
+parser.add_argument('--data', type=str, default='/home/csgrads/rao00134/smalltext',
+                    help='location of the data corpus')
+
+parser.add_argument('-f')
+
+args = parser.parse_args()
+
+
+class Dictionary(object):
+    def __init__(self):
+        self.word2idx = {}
+        self.idx2word = []
+        self.idx = 0
+    
+    def add_word(self, word):
+        if word not in self.word2idx:
+            self.idx2word.append(word)
+            self.word2idx[word] = len(self.idx2word) - 1
+        return self.word2idx[word]
+
+          
+    def __len__(self):
+        return len(self.idx2word)
+
+
+class Corpus(object):
+    def __init__(self, path):
+        self.dictionary = Dictionary()
+        self.train = self.tokenize(os.path.join(path, 'smalltext.train2.txt'))
+        self.valid = self.tokenize(os.path.join(path, 'smalltext.val2.txt'))
+        self.test = self.tokenize(os.path.join(path, 'smalltext.test2.txt'))
+
+
+    def tokenize(self, path):
+        """Tokenizes a text file."""
+        
+        # Add words to the dictionary
+        with open(path, 'r', encoding="utf8") as f:
+            for line in f:
+                words = line.split() + ['<eos>']
+                for word in words:
+                    self.dictionary.add_word(word)
+
+        # Tokenize file content
+        with open(path, 'r', encoding="utf8") as f:
+            idss = []
+            for line in f:
+                words = line.split() + ['<eos>']
+                ids = []
+                for word in words:
+                    ids.append(self.dictionary.word2idx[word])
+                idss.append(torch.tensor(ids).type(torch.int64))
+            ids = torch.cat(idss)
+
+        return ids
+
+
+
+def batchify(data, bsz):
+    """
+    Batch the data with size bsz
+    """
+    # Work out how cleanly we can divide the dataset into bsz parts.
+    nbatch = data.size(0) // bsz
+    # Trim off any extra elements that wouldn't cleanly fit (remainders).
+    data = data.narrow(0, 0, nbatch * bsz)
+    # Evenly divide the data across the bsz batches.
+    data = data.view(bsz, -1).t().contiguous()
+    return data.to(device)
+
+
+def get_batch(source, i):
+    """
+    Select seq_length long batches at once for training
+    Data and Targets will be differed in index by one
+    """
+    seq_len = min(seq_length, len(source) - 1 - i)
+    data = source[i:i+seq_len]
+    target = source[i+1:i+1+seq_len].view(-1)
+    return data, target
+
+def repackage_hidden(h):
+    """
+    Wraps hidden states in new Tensors, to detach them from their history.
+    For truncated backpropagation 
+    """
+    if isinstance(h, torch.Tensor):
+        return h.detach()
+    else:
+        return tuple(repackage_hidden(v) for v in h)
+
+
+class RNNModel(nn.Module):
+    """
+    Container module with an encoder, a recurrent module, and a decoder.
+    """
+
+    def __init__(self, ntoken, ninp, nhid, nlayers, dropout=0.5, tie_weights=False):
+        super(RNNModel, self).__init__()
+        self.drop = nn.Dropout(dropout)
+        self.encoder = nn.Embedding(ntoken, ninp)
+
+        self.LSTM = nn.LSTM(ninp, nhid, nlayers, dropout=dropout)
+        self.decoder = nn.Linear(nhid, ntoken)
+
+        self.init_weights()
+
+        self.nhid = nhid
+        self.nlayers = nlayers
+
+    def init_weights(self):
+        initrange = 0.1
+        self.encoder.weight.data.uniform_(-initrange, initrange)
+        self.decoder.bias.data.zero_()
+        self.decoder.weight.data.uniform_(-initrange, initrange)
+
+    def forward(self, input, hidden):
+        emb = self.drop(self.encoder(input))
+        output, hidden = self.LSTM(emb, hidden)
+        output = self.drop(output)
+        decoded = self.decoder(output.view(output.size(0)*output.size(1), output.size(2)))
+        return decoded.view(output.size(0), output.size(1), decoded.size(1)), hidden
+
+    def init_hidden(self, bsz):
+        weight = next(self.parameters())
+
+        return (weight.new_zeros(self.nlayers, bsz, self.nhid),
+                weight.new_zeros(self.nlayers, bsz, self.nhid))
+
+
+def evaluate(data_source, eval_batch_size):
+    """
+    Evaluates the performance of the trained model in input data source
+    """
+    # Turn on evaluation mode which disables dropout.
+    model.eval()
+    total_loss = 0.
+    ntokens = vocab_size
+    hidden = model.init_hidden(eval_batch_size)
+    with torch.no_grad():
+        for i in range(0, data_source.size(0) - 1, seq_length):
+            data, targets = get_batch(data_source, i)
+            output, hidden = model(data, hidden)
+            output_flat = output.view(-1, ntokens)
+            total_loss += len(data) * criterion(output_flat, targets).item()
+            hidden = repackage_hidden(hidden)
+    return total_loss / len(data_source)
+
+
+def train():
+    """
+    Training 
+    """
+    # Turn on training mode which enables dropout.
+    
+    model.train()
+    total_loss = 0.
+    start_time = time.time()
+    ntokens = vocab_size
+    hidden = model.init_hidden(batch_size)
+    for batch, i in enumerate(range(0, train_data.size(0) - 1, seq_length)):
+        data, targets = get_batch(train_data, i)
+        
+        # Starting each batch, we detach the hidden state from how it was previously produced.
+        # If we didn't, the model would try backpropagating all the way to start of the dataset.
+        
+        hidden = repackage_hidden(hidden)
+        model.zero_grad()
+        output, hidden = model(data, hidden)
+        loss = criterion(output.view(-1, ntokens), targets)
+        loss.backward()
+
+        # `clip_grad_norm` helps prevent the exploding gradient problem in RNNs / LSTMs.
+        clip_grad_norm_(model.parameters(), 0.25)
+        for p in model.parameters():
+            p.data.add_(-learning_rate, p.grad.data)
+
+        total_loss += loss.item()
+
+        if batch % log_interval == 0 and batch > 0:
+            cur_loss = total_loss / log_interval
+            elapsed = time.time() - start_time
+            print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:5.4f} | ms/batch {:5.2f} | '
+                    'loss {:5.2f} | ppl {:8.2f} |'.format(
+                epoch, batch, len(train_data) // seq_length, learning_rate,
+                elapsed * 1000 /log_interval, cur_loss, math.exp(cur_loss)))
+            total_loss = 0
+            start_time = time.time()
+
+def get_warmup_state(data_source):
+    """
+    Starting hidden states as zeros might not deliver the context 
+    So a warm up is on a desired primer text 
+    Returns the hidden state for actual generation 
+    """
+    # Turn on evaluation mode which disables dropout.
+    model.eval()
+    ntokens = vocab_size
+    hidden = model.init_hidden(1)
+    with torch.no_grad():
+        for i in range(0, data_source.size(0) - 1, seq_length):
+            data, targets = get_batch(data_source, i)
+            hidden = repackage_hidden(hidden)
+            output, hidden = model(data, hidden)         
+    return hidden
+
+
+# Hyper-parameters
+
+embed_size = 300
+hidden_size = 1024
+num_layers = 2
+num_epochs = 5
+batch_size = 30
+seq_length = 35
+learning_rate = 20.0
+dropout_value = 0.4
+log_interval = 100
+eval_batch_size = 10
+
+
+corpus = Corpus(args.data)
+
+
+#batchify the datasets
+train_data = batchify(corpus.train, batch_size)
+val_data = batchify(corpus.valid, eval_batch_size)
+test_data = batchify(corpus.test, eval_batch_size)
+
+vocab_size = len(corpus.dictionary)
+
+#prints the shape of the training, validation and test data
+print("\n")
+print("Shape of batchified training data: ", train_data.shape)
+print("Shape of batchified validation data: ", val_data.shape)
+print("Shape of batchified testing data: ", test_data.shape)
+print("\n")
+
+
+# Define model for training 
+
+model = RNNModel(ntoken=vocab_size, ninp=embed_size, nhid=hidden_size, nlayers=num_layers, dropout=dropout_value).to(device)
+criterion = nn.CrossEntropyLoss()
+
+
+# Start training the model
+
+best_val_loss = None
+training_loss = []
+validation_loss = []
+
+
+try:
+    for epoch in range(1, num_epochs+1):
+        epoch_start_time = time.time()
+        
+        # Start training for one epoch
+        train()
+        
+        # Get and store validation and training losses 
+        val_loss = evaluate(val_data, eval_batch_size)
+        tr_loss = evaluate(train_data, batch_size)
+        
+        
+        training_loss.append(tr_loss)
+        validation_loss.append(val_loss)
+        
+        print('-' * 122)
+        print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
+                'valid ppl {:8.2f} | training loss {:5.2f} | training ppl {:8.2f} |'.format(epoch, (time.time() - epoch_start_time),
+                                           val_loss, math.exp(val_loss), tr_loss, math.exp(tr_loss)))
+        print('-' * 122)
+        
+        
+        # Save the model if the validation loss is the best we've seen so far.
+        if not best_val_loss or val_loss < best_val_loss:
+            torch.save(model.state_dict(), "/home/csgrads/rao00134/model.pt") #path to save the model
+            best_val_loss = val_loss
+        else:
+            # Anneal the learning rate if no improvement has been seen in the validation dataset.
+            learning_rate = learning_rate /1.5
+except KeyboardInterrupt:
+    #Exits training if their is a keyboard interrupt
+    print('-' * 122)
+    print('Exiting from training early')
+[4mukko[24m:[1m~[0m% cat LM_eval.py
+from os import path
+import torch
+import math
+import os
+import random
+import re
+import time
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+import seaborn as sns
+import torch.nn as nn
+
+from torch.nn.utils import clip_grad_norm_
+import argparse
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+parser = argparse.ArgumentParser(description='Word Language Model using LSTM')
+
+parser.add_argument('--data', type=str, default='/home/csgrads/rao00134/smalltext',
+                    help='location of the data corpus')
+
+parser.add_argument('-f')
+
+args = parser.parse_args()
+
+"""
+Helper Functions
+"""
+def batchify(data, bsz):
+    """
+    Batch the data with size bsz
+    """
+    # Work out how cleanly we can divide the dataset into bsz parts.
+    nbatch = data.size(0) // bsz
+    # Trim off any extra elements that wouldn't cleanly fit (remainders).
+    data = data.narrow(0, 0, nbatch * bsz)
+    # Evenly divide the data across the bsz batches.
+    data = data.view(bsz, -1).t().contiguous()
+    return data.to(device)
+
+
+def get_batch(source, i):
+    """
+    Select seq_length long batches at once for training
+    Data and Targets will be differed in index by one
+    """
+    seq_len = min(seq_length, len(source) - 1 - i)
+    data = source[i:i+seq_len]
+    target = source[i+1:i+1+seq_len].view(-1)
+    return data, target
+
+def repackage_hidden(h):
+    """
+    Wraps hidden states in new Tensors, to detach them from their history.
+    For truncated backpropagation 
+    """
+    if isinstance(h, torch.Tensor):
+        return h.detach()
+    else:
+        return tuple(repackage_hidden(v) for v in h)
+
+def get_warmup_state(data_source):
+    """
+    Starting hidden states as zeros might not deliver the context 
+    So a warm up is on a desired primer text 
+    Returns the hidden state for actual generation 
+    """
+    # Turn on evaluation mode which disables dropout.
+    model.eval()
+    ntokens = vocab_size
+    hidden = model.init_hidden(1)
+    with torch.no_grad():
+        for i in range(0, data_source.size(0) - 1, seq_length):
+            data, targets = get_batch(data_source, i)
+            hidden = repackage_hidden(hidden)
+            output, hidden = model(data, hidden)         
+    return hidden
+
+def evaluate(data_source, eval_batch_size):
+    """
+    Evaluates the performance of the trained model in input data source
+    """
+    # Turn on evaluation mode which disables dropout.
+    model.eval()
+    total_loss = 0.
+    ntokens = vocab_size
+    hidden = model.init_hidden(eval_batch_size)
+    with torch.no_grad():
+        for i in range(0, data_source.size(0) - 1, seq_length):
+            data, targets = get_batch(data_source, i)
+            output, hidden = model(data, hidden)
+            output_flat = output.view(-1, ntokens)
+            total_loss += len(data) * criterion(output_flat, targets).item()
+            hidden = repackage_hidden(hidden)
+    return total_loss / len(data_source)
+
+class Dictionary(object):
+    def __init__(self):
+        self.word2idx = {}
+        self.idx2word = []
+        self.idx = 0
+    
+    def add_word(self, word):
+        if word not in self.word2idx:
+            self.idx2word.append(word)
+            self.word2idx[word] = len(self.idx2word) - 1
+        return self.word2idx[word]
+
+          
+    def __len__(self):
+        return len(self.idx2word)
+
+
+class Corpus(object):
+    def __init__(self, path):
+        self.dictionary = Dictionary()
+        self.train = self.tokenize(os.path.join(path, 'smalltext.train2.txt'))
+        self.valid = self.tokenize(os.path.join(path, 'smalltext.val2.txt'))
+        self.test = self.tokenize(os.path.join(path, 'smalltext.test2.txt'))
+
+
+    def tokenize(self, path):
+        """Tokenizes a text file."""
+        #assert os.path.exists(path)
+        # Add words to the dictionary
+        with open(path, 'r', encoding="utf8") as f:
+            for line in f:
+                words = line.split() + ['<eos>']
+                for word in words:
+                    self.dictionary.add_word(word)
+
+        # Tokenize file content
+        with open(path, 'r', encoding="utf8") as f:
+            idss = []
+            for line in f:
+                words = line.split() + ['<eos>']
+                ids = []
+                for word in words:
+                    ids.append(self.dictionary.word2idx[word])
+                idss.append(torch.tensor(ids).type(torch.int64))
+            ids = torch.cat(idss)
+
+        return ids
+
+class RNNModel(nn.Module):
+    """
+    Container module with an encoder, a recurrent module, and a decoder.
+    PyTorch provides the facility to write custom models
+    """
+
+    def __init__(self, ntoken, ninp, nhid, nlayers, dropout=0.5, tie_weights=False):
+        super(RNNModel, self).__init__()
+        self.drop = nn.Dropout(dropout)
+        self.encoder = nn.Embedding(ntoken, ninp)
+
+        self.LSTM = nn.LSTM(ninp, nhid, nlayers, dropout=dropout)
+        self.decoder = nn.Linear(nhid, ntoken)
+
+        self.init_weights()
+
+        self.nhid = nhid
+        self.nlayers = nlayers
+
+    def init_weights(self):
+        initrange = 0.1
+        self.encoder.weight.data.uniform_(-initrange, initrange)
+        self.decoder.bias.data.zero_()
+        self.decoder.weight.data.uniform_(-initrange, initrange)
+
+    def forward(self, input, hidden):
+        emb = self.drop(self.encoder(input))
+        output, hidden = self.LSTM(emb, hidden)
+        output = self.drop(output)
+        decoded = self.decoder(output.view(output.size(0)*output.size(1), output.size(2)))
+        return decoded.view(output.size(0), output.size(1), decoded.size(1)), hidden
+
+    def init_hidden(self, bsz):
+        weight = next(self.parameters())
+
+        return (weight.new_zeros(self.nlayers, bsz, self.nhid),
+                weight.new_zeros(self.nlayers, bsz, self.nhid))
+
+#Hyperparameters
+embed_size = 300
+hidden_size = 1024
+num_layers = 2
+num_epochs = 5
+batch_size = 30
+seq_length = 35
+learning_rate = 20.0
+dropout_value = 0.4
+log_interval = 100
+eval_batch_size = 10
+
+corpus = Corpus(args.data)
+
+#Batchify Datasets
+train_data = batchify(corpus.train, batch_size)
+val_data = batchify(corpus.valid, eval_batch_size)
+test_data = batchify(corpus.test, eval_batch_size)
+
+vocab_size = len(corpus.dictionary)
+
+
+#Defining the model and loading the states
+model = RNNModel(ntoken=vocab_size, ninp=embed_size, nhid=hidden_size, nlayers=num_layers, dropout=dropout_value).to(device)
+model.load_state_dict(torch.load("/home/csgrads/rao00134/model.pt"))
+
+criterion = nn.CrossEntropyLoss()
+
+#Run on training Data
+train_loss = evaluate(train_data, batch_size)
+
+print('=' * 89)
+print('| Train loss {:5.2f} | train ppl {:8.2f}'.format(
+    train_loss, math.exp(train_loss)))
+print('=' * 89)
+
+#Run on Validation Data
+val_loss = evaluate(val_data, eval_batch_size)
+
+print('=' * 89)
+print('| Validation loss {:5.2f} | validation ppl {:8.2f}'.format(
+    val_loss, math.exp(val_loss)))
+print('=' * 89)
+
+#Run on Test data
+test_loss = evaluate(test_data, eval_batch_size)
+
+print('=' * 89)
+print('| End of training | test loss {:5.2f} | test ppl {:8.2f}'.format(
+    test_loss, math.exp(test_loss)))
+print('=' * 89)
+
+
+#ANALYSIS QUESTIONS
+
+"""
+
+1. Describe the language model that gave you the best results on the validation data,
+and that you used on the test data.  What was the structure of that language model,
+and what hyperparameters did you set (and what values did you use to set them)?
+What sources gave you "inspiration" for this model? (200 word minimum, show word count)
+
+The Language Model that gave the best results on the validation data used the LSTM network
+and I used the same on the test data. The model consists of a dropout layer, encoder,
+LSTM, decoder. The final hyperparameters that produced the best results were as follows:
+(I trained the model only for 5 epochs as it was taking a lot of time to train)
+embed_size = 300
+hidden_size = 1024
+num_layers = 2
+num_epochs = 5
+batch_size = 30
+seq_length = 35
+learning_rate = 20.0
+dropout_value = 0.4
+log_interval = 100
+eval_batch_size = 10
+
+I ran the model multiple times changing the hyperparameters. For the first time I ran
+the model with embedding size 100, hidde size 100, num_layers 1 and dropout 0. For the
+next run, I increased hidden size to 200 which gave better results. So I increased the
+hidden size even more to 1024, num_layers to 2 and dropout to 0.4 and I got much better
+results with these hyperparameters. 
+
+I found multiple sources which helped me solve the problem and implement this Language Model.
+Some of which are listed below:
+https://github.com/pytorch/examples/tree/master/word_language_model 
+This one really gives an overall understanding of the Word Language Model. All the files
+are documented well making it easy to understand the task and help implement your own model.
+
+I found another good model which helped me in implementing mine:
+https://github.com/sleebapaul/gospel_of_rnn 
+
+
+Word Count: 227
+
+"""
+
+
+"""
+
+2. Explain what Perplexity is, and what it tells us about a language model (in general). 
+Compare the Perplexity on your validation data, test data, and training data. How did they
+differ? What conclusions can we draw from this result? (200 word minimum, show word count)
+
+Perplexity is an evaluation metric for Language Models. It is an Intrinsic Evaluation
+Method which nvolves finding some metric to evaluate the language model itself, not
+taking into account the specific tasks it’s going to be used for.
+Perplexity can also be defined as the exponential of the cross-entropy, where the
+cross-entropy indicates the average number of bits needed to encode one word, and
+perplexity is the number of words that can be encoded with those bit.
+
+Perplexity measures how good a Language Model is. If we have a perplexity of 100, it means
+that whenever the model is trying to guess the next word it is as confused as if it had
+to pick between 100 words. Lower Perplexity is better.
+
+The training perplexity was the lowest and the test perplexity was the highest. While 
+training the model we can see the perplexity is really high for the initial steps and it 
+decreases with each epoch as the model keeps on learning on the same data. The test perplexity 
+is high compared to the training data as we are testing the trained model on new data. It is
+still less than the initial values while training which means the model has learned.  
+
+The following link explains perplexity very well:
+https://towardsdatascience.com/perplexity-in-language-models-87a196019a94
+
+Word Count: 207
+
+"""
+
+
+"""
+
+3. How does the Perplexity of your final model on your test data compare to published 
+Neural Language Model perplexity results? Find one paper that reports the results of a 
+NLM using perplexity and compare your results to those.  Provide a citation to that paper 
+in your response. How does your Perplexity compare to the published result? What kind of 
+model and data did the published result use? What do you think accounts for the difference 
+in the perplexity you see? (200 word minimum, show word count) 
+
+The perplexity of the Final Model is not that great compared to the published NeuraL Language 
+Models but still comparable. I would say that the model can give better results if I figure out 
+more factors affecting it. I have tuned the model as much as I could but I guess better 
+results can be produced usimg this model. 
+
+I found a paper on NLM that uses LSTM and reports the results using perplexity. The perplexity 
+they reported is good compared to mine. They used LSTM and fixed the hidden size to 100. They 
+also compared the results to the vanilla RNN but got the best results with LSTM. They reported 
+that The simpler “vanilla” RNN network showed to be unstable whilte they were changing the input 
+of the model . They reported the perplexity on two datasets: Penn Treebank corpus (144) and MALACH 
+corpus (99) and the perplexity of my model on the test data is 309. 
+
+I guess I can get better results if I try and change more hyperparameters and if I could train 
+the model on the larger corpus. I had to reduce the size of the corpus as it was taking really 
+long to run even 1 epoch. So, if I could figure that out, I could have obtained better results. 
+
+Link to the paper: https://link.springer.com/chapter/10.1007/978-3-319-25789-1_25#Sec5
+
+Word Count: 221
+
+"""[4mukko[24m:[1m~[0m% cd smalltext
+[4mukko[24m:[1m~/smalltext[0m% wccd smalltext[20Gat LM_eval.py[26Gtrain.py[19Gnvidia-smi[K[19Gdate[Knvidia-smi[19Gcat LM_train.py[26Geval.py[K[20Gd smalltext[K[19Gwc[K smalltext.train2.txt
+  79999  848437 4150123 smalltext.train2.txt
+[4mukko[24m:[1m~/smalltext[0m% wc smalltext.train2.txtn[P[P[P[P[P[1@v[1@a[1@l
+  24683  255763 1236547 smalltext.val2.txt
+[4mukko[24m:[1m~/smalltext[0m% wc smalltext.val2.txtval[P[P[P[1@t[1@e[1@s[1@t
+ 19999 171228 826574 smalltext.test2.txt
+[4mukko[24m:[1m~/smalltext[0m% cd ..
+[4mukko[24m:[1m~[0m% time python3 LM_train.py
+cuda
+
+
+
+
+Shape of batchified training data:  torch.Size([30947, 30])
+Shape of batchified validation data:  torch.Size([28044, 10])
+Shape of batchified testing data:  torch.Size([19122, 10])
+
+
+LM_train.py:211: UserWarning: This overload of add_ is deprecated:
+	add_(Number alpha, Tensor other)
+Consider using one of the following signatures instead:
+	add_(Tensor other, *, Number alpha) (Triggered internally at  ../torch/csrc/utils/python_arg_parser.cpp:1050.)
+  p.data.add_(-learning_rate, p.grad.data)
+| epoch   1 |   100/  884 batches | lr 20.0000 | ms/batch 77.96 | loss  8.68 | ppl  5878.39 |
+| epoch   1 |   200/  884 batches | lr 20.0000 | ms/batch 76.78 | loss  7.46 | ppl  1736.93 |
+| epoch   1 |   300/  884 batches | lr 20.0000 | ms/batch 76.79 | loss  6.95 | ppl  1038.02 |
+| epoch   1 |   400/  884 batches | lr 20.0000 | ms/batch 76.78 | loss  6.41 | ppl   608.48 |
+| epoch   1 |   500/  884 batches | lr 20.0000 | ms/batch 76.80 | loss  6.03 | ppl   417.69 |
+| epoch   1 |   600/  884 batches | lr 20.0000 | ms/batch 76.80 | loss  5.84 | ppl   343.30 |
+| epoch   1 |   700/  884 batches | lr 20.0000 | ms/batch 76.82 | loss  5.71 | ppl   302.41 |
+| epoch   1 |   800/  884 batches | lr 20.0000 | ms/batch 76.79 | loss  5.64 | ppl   282.74 |
+--------------------------------------------------------------------------------------------------------------------------
+| end of epoch   1 | time: 98.41s | valid loss  5.61 | valid ppl   273.51 | training loss  5.35 | training ppl   209.99 |
+--------------------------------------------------------------------------------------------------------------------------
+| epoch   2 |   100/  884 batches | lr 20.0000 | ms/batch 77.58 | loss  5.49 | ppl   242.86 |
+| epoch   2 |   200/  884 batches | lr 20.0000 | ms/batch 76.82 | loss  5.38 | ppl   217.17 |
+| epoch   2 |   300/  884 batches | lr 20.0000 | ms/batch 76.82 | loss  5.38 | ppl   216.58 |
+| epoch   2 |   400/  884 batches | lr 20.0000 | ms/batch 76.82 | loss  5.21 | ppl   182.23 |
+| epoch   2 |   500/  884 batches | lr 20.0000 | ms/batch 76.80 | loss  5.14 | ppl   171.53 |
+| epoch   2 |   600/  884 batches | lr 20.0000 | ms/batch 76.80 | loss  5.05 | ppl   155.29 |
+| epoch   2 |   700/  884 batches | lr 20.0000 | ms/batch 76.77 | loss  5.03 | ppl   152.42 |
+| epoch   2 |   800/  884 batches | lr 20.0000 | ms/batch 76.79 | loss  5.04 | ppl   155.17 |
+--------------------------------------------------------------------------------------------------------------------------
+| end of epoch   2 | time: 98.37s | valid loss  5.25 | valid ppl   190.28 | training loss  4.85 | training ppl   128.10 |
+--------------------------------------------------------------------------------------------------------------------------
+| epoch   3 |   100/  884 batches | lr 20.0000 | ms/batch 77.57 | loss  5.05 | ppl   156.49 |
+| epoch   3 |   200/  884 batches | lr 20.0000 | ms/batch 76.79 | loss  4.89 | ppl   133.45 |
+| epoch   3 |   300/  884 batches | lr 20.0000 | ms/batch 76.79 | loss  4.98 | ppl   145.82 |
+| epoch   3 |   400/  884 batches | lr 20.0000 | ms/batch 76.83 | loss  4.81 | ppl   122.41 |
+| epoch   3 |   500/  884 batches | lr 20.0000 | ms/batch 76.80 | loss  4.78 | ppl   118.91 |
+| epoch   3 |   600/  884 batches | lr 20.0000 | ms/batch 76.82 | loss  4.64 | ppl   103.39 |
+| epoch   3 |   700/  884 batches | lr 20.0000 | ms/batch 76.83 | loss  4.65 | ppl   105.02 |
+| epoch   3 |   800/  884 batches | lr 20.0000 | ms/batch 76.81 | loss  4.69 | ppl   108.33 |
+--------------------------------------------------------------------------------------------------------------------------
+| end of epoch   3 | time: 98.66s | valid loss  5.00 | valid ppl   147.69 | training loss  4.49 | training ppl    88.84 |
+--------------------------------------------------------------------------------------------------------------------------
+| epoch   4 |   100/  884 batches | lr 20.0000 | ms/batch 166.82 | loss  4.75 | ppl   116.12 |
+| epoch   4 |   200/  884 batches | lr 20.0000 | ms/batch 165.28 | loss  4.58 | ppl    97.84 |
+| epoch   4 |   300/  884 batches | lr 20.0000 | ms/batch 165.95 | loss  4.71 | ppl   110.91 |
+| epoch   4 |   400/  884 batches | lr 20.0000 | ms/batch 162.36 | loss  4.54 | ppl    93.30 |
+| epoch   4 |   500/  884 batches | lr 20.0000 | ms/batch 164.94 | loss  4.51 | ppl    91.05 |
+| epoch   4 |   600/  884 batches | lr 20.0000 | ms/batch 165.13 | loss  4.36 | ppl    78.59 |
+| epoch   4 |   700/  884 batches | lr 20.0000 | ms/batch 163.56 | loss  4.40 | ppl    81.20 |
+| epoch   4 |   800/  884 batches | lr 20.0000 | ms/batch 165.13 | loss  4.43 | ppl    84.32 |
+--------------------------------------------------------------------------------------------------------------------------
+| end of epoch   4 | time: 206.75s | valid loss  4.89 | valid ppl   132.72 | training loss  4.21 | training ppl    67.54 |
+--------------------------------------------------------------------------------------------------------------------------
+| epoch   5 |   100/  884 batches | lr 20.0000 | ms/batch 165.55 | loss  4.53 | ppl    92.53 |
+| epoch   5 |   200/  884 batches | lr 20.0000 | ms/batch 165.28 | loss  4.36 | ppl    78.45 |
+| epoch   5 |   300/  884 batches | lr 20.0000 | ms/batch 165.46 | loss  4.48 | ppl    88.64 |
+| epoch   5 |   400/  884 batches | lr 20.0000 | ms/batch 166.58 | loss  4.32 | ppl    75.12 |
+| epoch   5 |   500/  884 batches | lr 20.0000 | ms/batch 165.00 | loss  4.30 | ppl    73.34 |
+| epoch   5 |   600/  884 batches | lr 20.0000 | ms/batch 164.74 | loss  4.15 | ppl    63.66 |
+| epoch   5 |   700/  884 batches | lr 20.0000 | ms/batch 154.69 | loss  4.19 | ppl    65.74 |
+| epoch   5 |   800/  884 batches | lr 20.0000 | ms/batch 76.82 | loss  4.23 | ppl    68.66 |
+--------------------------------------------------------------------------------------------------------------------------
+| end of epoch   5 | time: 159.26s | valid loss  4.81 | valid ppl   123.26 | training loss  3.95 | training ppl    51.69 |
+--------------------------------------------------------------------------------------------------------------------------
+672.580u 8.563s 11:20.03 100.1%	0+0k 0+3052720io 0pf+0w
+[4mukko[24m:[1m~[0m% time python3 LM_eval.py
+=========================================================================================
+| Validation loss  4.81 | validation ppl   123.26
+=========================================================================================
+=========================================================================================
+| End of training | test loss  5.73 | test ppl   309.18
+=========================================================================================
+| Train loss  3.95 | Training ppl    51.69
+=========================================================================================
+46.159u 6.366s 0:47.84 109.7%	0+0k 610576+0io 0pf+0w
+[4mukko[24m:[1m~[0m% exit
+exit
+
+Script done on 2022-02-27 21:02:14-06:00 [COMMAND_EXIT_CODE="0"]
